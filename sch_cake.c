@@ -136,7 +136,6 @@ struct cake_flow {
 	struct sk_buff	  *tail;
 	struct list_head  flowchain;
 	s32		  deficit;
-	u32		  dropped;
 	struct cobalt_vars cvars;
 	u16		  srchost; /* index into cake_host table */
 	u16		  dsthost;
@@ -190,6 +189,7 @@ struct cake_tin_data {
 
 	u32	packets;
 	u64	bytes;
+	u64	prev_bytes;
 
 	u32	ack_drops;
 
@@ -333,6 +333,17 @@ static const u8 diffserv8[] = {
 	7, 2, 2, 2, 2, 2, 2, 2,
 };
 
+static const u8 diffserv5[] = {
+	0, 1, 0, 0, 3, 0, 0, 0,
+	2, 0, 0, 0, 0, 0, 0, 0,
+	3, 0, 3, 0, 3, 0, 3, 0,
+	3, 0, 3, 0, 3, 0, 3, 0,
+	4, 0, 3, 0, 3, 0, 3, 0,
+	4, 0, 0, 0, 4, 0, 4, 0,
+	4, 0, 0, 0, 0, 0, 0, 0,
+	4, 0, 0, 0, 0, 0, 0, 0,
+};
+
 static const u8 diffserv4[] = {
 	0, 1, 0, 0, 2, 0, 0, 0,
 	1, 0, 0, 0, 0, 0, 0, 0,
@@ -370,6 +381,7 @@ static const u8 besteffort[] = {
 
 static const u8 normal_order[] = {0, 1, 2, 3, 4, 5, 6, 7};
 static const u8 bulk_order[] = {1, 0, 2, 3};
+static const u8 le_order[] = {1, 2, 0, 3, 4};
 
 #define REC_INV_SQRT_CACHE (16)
 static u32 cobalt_rec_inv_sqrt_cache[REC_INV_SQRT_CACHE] = {0};
@@ -1643,7 +1655,6 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
 	sch->qstats.backlog -= len;
 	qdisc_tree_reduce_backlog(sch, 1, len);
 
-	flow->dropped++;
 	b->tin_dropped++;
 	sch->qstats.drops++;
 
@@ -1677,7 +1688,7 @@ static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
 		/* ToS is in the second byte of iphdr */
 		dscp = ipv4_get_dsfield((struct iphdr *)buf) >> 2;
 
-		if (wash && dscp) {
+		if (wash && dscp > 1) {
 			const int wlen = offset + sizeof(struct iphdr);
 
 			if (!pskb_may_pull(skb, wlen) ||
@@ -1697,7 +1708,7 @@ static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
 		/* Traffic class is in the first and second bytes of ipv6hdr */
 		dscp = ipv6_get_dsfield((struct ipv6hdr *)buf) >> 2;
 
-		if (wash && dscp) {
+		if (wash && dscp > 1) {
 			const int wlen = offset + sizeof(struct ipv6hdr);
 
 			if (!pskb_may_pull(skb, wlen) ||
@@ -2298,7 +2309,6 @@ retry:
 			flow->deficit -= len;
 			b->tin_deficit -= len;
 		}
-		flow->dropped++;
 		b->tin_dropped++;
 		qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
@@ -2563,6 +2573,53 @@ static int cake_config_diffserv8(struct Qdisc *sch)
 	return 0;
 }
 
+static int cake_config_diffserv5(struct Qdisc *sch)
+{
+/*  Further pruned list of traffic classes for four-class system:
+ *
+ *	    Latency Sensitive  (CS7, CS6, EF, VA, CS5, CS4)
+ *	    Streaming Media    (AF4x, AF3x, CS3, AF2x, TOS4, CS2, TOS1)
+ *	    Background Traffic (CS1)
+ *	    Best Effort        (CS0, AF1x, TOS2, and those not specified)
+ *	    Least Effort       (LE)
+ *
+ *		Total 5 traffic classes.
+ */
+
+	struct cake_sched_data *q = qdisc_priv(sch);
+	u32 mtu = psched_mtu(qdisc_dev(sch));
+	u64 rate = q->rate_bps;
+	u32 quantum = 1024;
+	u32 i;
+
+	q->tin_cnt = 5;
+
+	/* codepoint to class mapping */
+	q->tin_index = diffserv5;
+	q->tin_order = le_order;
+
+	/* class characteristics */
+	cake_set_rate(&q->tins[0], rate, mtu,
+		      us_to_ns(q->target), us_to_ns(q->interval));
+	cake_set_rate(&q->tins[1], rate >> 6, mtu,
+		      us_to_ns(q->target), us_to_ns(q->interval));
+	cake_set_rate(&q->tins[2], rate >> 4, mtu,
+		      us_to_ns(q->target), us_to_ns(q->interval));
+	cake_set_rate(&q->tins[3], rate >> 1, mtu,
+		      us_to_ns(q->target), us_to_ns(q->interval));
+	cake_set_rate(&q->tins[4], rate >> 2, mtu,
+		      us_to_ns(q->target), us_to_ns(q->interval));
+
+	/* bandwidth-sharing weights */
+	q->tins[0].tin_quantum = quantum;	/*BE*/
+	q->tins[1].tin_quantum = quantum >> 6;	/*LE*/
+	q->tins[2].tin_quantum = quantum >> 4;	/*BK*/
+	q->tins[3].tin_quantum = quantum >> 1;	/*VI*/
+	q->tins[4].tin_quantum = quantum >> 2;	/*VO*/
+
+	return 0;
+}
+
 static int cake_config_diffserv4(struct Qdisc *sch)
 {
 /*  Further pruned list of traffic classes for four-class system:
@@ -2579,6 +2636,7 @@ static int cake_config_diffserv4(struct Qdisc *sch)
 	u32 mtu = psched_mtu(qdisc_dev(sch));
 	u64 rate = q->rate_bps;
 	u32 quantum = 1024;
+	u32 i;
 
 	q->tin_cnt = 4;
 
@@ -2655,6 +2713,10 @@ static void cake_reconfigure(struct Qdisc *sch)
 
 	case CAKE_DIFFSERV_DIFFSERV8:
 		ft = cake_config_diffserv8(sch);
+		break;
+
+	case CAKE_DIFFSERV_DIFFSERV5:
+		ft = cake_config_diffserv5(sch);
 		break;
 
 	case CAKE_DIFFSERV_DIFFSERV4:
@@ -3064,6 +3126,9 @@ static int cake_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 
 		PUT_TSTAT_U64(THRESHOLD_RATE64, b->tin_rate_bps);
 		PUT_TSTAT_U64(SENT_BYTES64, b->bytes);
+		PUT_TSTAT_U32(TRAFFIC_BYTES, (u32)(b->bytes - b->prev_bytes));
+		b->prev_bytes = b->bytes;
+
 		PUT_TSTAT_U32(BACKLOG_BYTES, b->tin_backlog);
 
 		PUT_TSTAT_U32(TARGET_US,
@@ -3186,7 +3251,6 @@ static int cake_dump_class_stats(struct Qdisc *sch, unsigned long cl,
 			cake_maybe_unlock(sch);
 		}
 		qs.backlog = b->backlogs[idx % CAKE_QUEUES];
-		qs.drops = flow->dropped;
 	}
 	if (gnet_stats_copy_queue(d, NULL, &qs, qs.qlen) < 0)
 		return -1;
